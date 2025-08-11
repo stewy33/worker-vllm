@@ -2,6 +2,7 @@ import os
 import logging
 import json
 import asyncio
+import inspect
 
 from dotenv import load_dotenv
 from typing import AsyncGenerator, Optional
@@ -244,6 +245,10 @@ class OpenAIvLLMEngine(vLLMEngine):
         elif openai_request.openai_route in ["/v1/chat/completions", "/v1/completions"]:
             async for response in self._handle_chat_or_completion_request(openai_request):
                 yield response
+        elif openai_request.openai_route == "/v1/load_lora_adapter":
+            yield await self._handle_load_lora(openai_request)
+        elif openai_request.openai_route == "/v1/unload_lora_adapter":
+            yield await self._handle_unload_lora(openai_request)
         else:
             yield create_error_response("Invalid route").model_dump()
     
@@ -298,4 +303,84 @@ class OpenAIvLLMEngine(vLLMEngine):
                 if self.raw_openai_output:
                     batch = "".join(batch)
                 yield batch
+
+    async def _maybe_await(self, result):
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def _handle_load_lora(self, openai_request: JobInput):
+        if not getattr(self.engine_args, "enable_lora", False):
+            return create_error_response("LoRA not enabled. Set ENABLE_LORA=1 in environment.").model_dump()
+
+        data = openai_request.openai_input or {}
+        lora_name = data.get("lora_name") or data.get("name")
+        lora_path = data.get("lora_path") or data.get("path")
+        base_model_name = data.get("base_model_name") or self.engine_args.model
+
+        if not lora_name or not lora_path:
+            return create_error_response("Missing required fields: lora_name and lora_path").model_dump()
+
+        try:
+            module = LoRAModulePath(name=lora_name, path=lora_path, base_model_name=base_model_name)
+        except Exception as e:
+            return create_error_response(f"Invalid LoRA module parameters: {e}").model_dump()
+
+        load_attempts = [
+            (self.serving_models, "load_lora_adapters"),
+            (self.serving_models, "load_loras"),
+            (self.serving_models, "register_lora_adapters"),
+            (self.serving_models, "add_lora_adapters"),
+            (self.llm, "load_lora_adapters"),
+            (self.llm, "load_loras"),
+        ]
+
+        for obj, method_name in load_attempts:
+            method = getattr(obj, method_name, None)
+            if method is None:
+                continue
+            try:
+                try:
+                    await self._maybe_await(method([module]))
+                except TypeError:
+                    await self._maybe_await(method(module))
+                return {"message": "LoRA adapter loaded", "name": lora_name}
+            except Exception as e:
+                logging.info(f"Attempt to load LoRA with {obj.__class__.__name__}.{method_name} failed: {e}")
+
+        return create_error_response("Runtime LoRA loading is not supported by this vLLM build").model_dump()
+
+    async def _handle_unload_lora(self, openai_request: JobInput):
+        if not getattr(self.engine_args, "enable_lora", False):
+            return create_error_response("LoRA not enabled. Set ENABLE_LORA=1 in environment.").model_dump()
+
+        data = openai_request.openai_input or {}
+        lora_name = data.get("lora_name") or data.get("name")
+        lora_names = data.get("lora_names") or ([lora_name] if lora_name else None)
+
+        if not lora_names:
+            return create_error_response("Missing required field: lora_name or lora_names").model_dump()
+
+        unload_attempts = [
+            (self.serving_models, "unload_lora_adapters"),
+            (self.serving_models, "unload_loras"),
+            (self.serving_models, "unregister_lora_adapters"),
+            (self.llm, "unload_lora_adapters"),
+            (self.llm, "unload_loras"),
+        ]
+
+        for obj, method_name in unload_attempts:
+            method = getattr(obj, method_name, None)
+            if method is None:
+                continue
+            try:
+                try:
+                    await self._maybe_await(method(lora_names))
+                except TypeError:
+                    await self._maybe_await(method(lora_names[0]))
+                return {"message": "LoRA adapter(s) unloaded", "names": lora_names}
+            except Exception as e:
+                logging.info(f"Attempt to unload LoRA with {obj.__class__.__name__}.{method_name} failed: {e}")
+
+        return create_error_response("Runtime LoRA unloading is not supported by this vLLM build").model_dump()
             
